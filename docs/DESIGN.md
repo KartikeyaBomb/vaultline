@@ -28,12 +28,24 @@ The numbers in the project pitch are targets. The README reports whatever `bench
 
 | Target | Definition | Measured by |
 |---|---|---|
-| ~12:1 dedup across 30 daily snapshots of a 20 GB dataset | (sum of logical bytes across all 30 snapshots) ÷ (bytes of unique chunks before compression). Compression is reported separately so it doesn't inflate the ratio. | `bench/run30` with `bench/datagen` churn model |
-| Restore 20 GB in < 60 s after losing 1 of 5 nodes | Wall-clock time from `vaultline restore` start to a verified tree (all file hashes match), with one node container killed before the restore starts | `bench/restore-degraded` |
+| High dedup across 30 daily snapshots of real data | (sum of logical bytes across all 30 snapshots) ÷ (bytes of unique chunks before compression). Compression is reported separately so it doesn't inflate the ratio. | `bench/run30` on the kernel dataset (below) |
+| CDC handles edits inside large files | New bytes stored per day ≈ bytes actually edited, not whole-file size | `bench/synthetic` (~200 MB of large files with inserts and appends) |
+| Fast restore after losing 1 of 5 nodes | Restore throughput (MB/s) and wall-clock time from `vaultline restore` start to a verified tree (all file hashes match), with one node killed before the restore starts | `bench/restore-degraded` |
 | ~65% lower projected storage cost under an 80%-cold model | Cost per month of all-hot 3x replicated storage vs. 20% hot 3x + 80% in S3, with prices taken from config | `bench/costmodel` |
 | Recovery under crash, partition, corruption | Chaos tests pass: no acknowledged snapshot is lost, all restores verify, and the cluster returns to 3 replicas per chunk | `internal/testcluster` chaos tests + `deploy/chaos.sh` |
 
-**Disk budget warning:** a full 20 GB × 30-day run with 3x replication needs about 100–150 GB of free disk. `bench` takes a `--scale` flag. Use `--scale 0.1` (2 GB) while developing, and run the full 20 GB once on a cloud VM or an external disk.
+### Benchmark datasets
+
+**Primary: Linux kernel source, 30 consecutive days.** The source tree is about 1.5 GB with about 80K files.
+
+- `bench/kernel/fetch.sh` makes a partial clone of the mainline kernel (`git clone --filter=blob:none --shallow-since=<start-45d>`), so the full history is never downloaded.
+- `bench/kernel/commits.txt` pins 30 commit SHAs: for each day in a fixed date range, the last commit on `master` before 23:59 UTC that day. Pinning makes the benchmark reproducible.
+- `bench/run30` checks out each commit into the **same** working directory and backs it up as that day's snapshot. `git checkout` only rewrites changed files, so their mtimes change just as they would in a real daily backup, and the incremental path is exercised.
+- Mainline changes much more during the 2-week merge window after a release than during the rc weeks. BENCHMARKS.md records the date range and which phase of the release cycle it covers, because both affect the dedup ratio.
+
+**Secondary: synthetic large files (~200 MB).** Most kernel files are smaller than the 16 KiB minimum chunk, so on that dataset dedup mostly comes from whole unchanged files. `bench/synthetic` generates a few large files (seeded, deterministic) and applies daily inserts, appends, and in-place edits. This shows that content-defined chunking only stores the changed regions.
+
+**Disk budget:** the whole benchmark should fit in about 5 GB: the kernel checkout (~1.5 GB) + the partial clone (~1 GB) + 3 compressed replicas of the unique chunks + a restore target. Nothing in this project needs a cloud VM.
 
 ## 3. Architecture
 
@@ -110,7 +122,7 @@ Expected tradeoff: a smaller average chunk size gives better dedup but more inde
 4. If a chunk is `cold`, do a ranged GET from its S3 pack.
 5. Write each file with `pwrite` at its chunk offsets, set mode and mtime, then verify the file's hash against the tree.
 
-To restore 20 GB in under 60 s, the client needs about 340 MB/s, so reads are spread across all 4 surviving nodes. Placement spreads chunks evenly, so losing one node removes about 1/5 of the read bandwidth and makes no data unavailable.
+Reads are spread across all 4 surviving nodes. Placement spreads chunks evenly, so losing one node removes about 1/5 of the read bandwidth and makes no data unavailable. Restore speed is reported as throughput (MB/s), because that number doesn't depend on dataset size.
 
 ## 8. Placement and replication
 
@@ -193,7 +205,7 @@ internal/
   faultnet/             fault-injecting network
   testcluster/          in-process cluster harness + chaos tests
 deploy/                 docker-compose (5 nodes, MinIO, Prometheus, Grafana, Jaeger), chaos.sh
-bench/                  datagen, run30, restore-degraded, costmodel
+bench/                  kernel/ (fetch.sh, commits.txt), synthetic, run30, restore-degraded, costmodel
 docs/                   DESIGN.md, BENCHMARKS.md
 ```
 
@@ -214,8 +226,8 @@ docs/                   DESIGN.md, BENCHMARKS.md
 
 ## 16. Risks and open questions
 
-- **Disk space for the full benchmark** (see §2). Develop at `--scale 0.1`.
-- **One file per chunk** on the local store means about 500K+ inodes per node at full scale. That's acceptable for v0.1. Local pack files are the fallback if `ls`/fsync overhead becomes a bottleneck.
+- **Small-file-heavy primary dataset:** on the kernel tree, the chunker matters less than file-level dedup. The synthetic large-file benchmark covers chunking, and both results are reported separately.
+- **One file per chunk** on the local store would mean about 500K+ inodes per node for a 20 GB+ dataset. The kernel benchmark stays far below that, so it's acceptable for v0.1. Local pack files are the fallback if `ls`/fsync overhead becomes a bottleneck.
 - **FSM size:** the chunk index of about 500K entries in bbolt is fine. Raft snapshots of the FSM use bbolt's `Tx.WriteTo`.
 - **Leader bottleneck on commit verification:** batched `HasChunks` should handle it. If not, the client can attach replica acks to the commit instead.
-- **Synthetic churn model:** the dedup ratio depends heavily on how the generator mutates data. The model (files touched per day, edit types, insert/append/delete mix) is documented in BENCHMARKS.md so the number can be reproduced and isn't tuned to hit a target.
+- **Choice of date range:** the kernel dedup ratio depends on which 30 days are picked (merge window vs. rc weeks). The range is chosen and pinned before the first run, and it isn't changed afterwards to improve the number.
